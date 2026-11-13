@@ -1,0 +1,35 @@
+
+# Python cache
+__pycache__/
+*.py[cod]
+
+# Virtual environments
+.venv/
+venv/
+
+# Python testing
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Editor and operating system
+.vscode/
+.DS_Store
+
+# Environment variables and secrets
+.env
+.env.*
+
+# Temporary files
+*.log
+*.tmp
+
+# Build output
+build/
+dist/
+*.egg-info/
+
+# Runtime peer files
+downloads/
+chunks/
+peer_data/
