@@ -2,100 +2,292 @@
 import socket
 import threading
 import sys
+import time
+import json
+import uuid
 
 HOST = "127.0.0.1"
-
 FIRST_PORT = 5001
 LAST_PORT = 5010
 
+VERSION = 1
+HEARTBEAT_INTERVAL = 2
+FAILURE_TIMEOUT = 6
+ACK_TIMEOUT = 1
+MAX_ATTEMPTS = 5
 
-def send_message(udp_socket, port, message):
-    """Send a UDP message to another local peer."""
+SESSION_ID = uuid.uuid4().hex
 
-    udp_socket.sendto(
-        message.encode("utf-8"),
-        (HOST, port)
-    )
+# TEMPORARY TEST: Peer 5002 drops its first CHAT ACK
 
 
-def discover_peers(udp_socket, my_port):
-    """Announce ourselves to possible peers."""
+def send_packet(sock, port, packet):
+    """Send a text or JSON packet using UDP."""
+
+    if isinstance(packet, dict):
+        data = json.dumps(packet).encode("utf-8")
+    else:
+        data = packet.encode("utf-8")
+
+    sock.sendto(data, (HOST, port))
+
+
+def discover_peers(sock, my_port):
+    """Send JOIN to possible local peers."""
 
     for port in range(FIRST_PORT, LAST_PORT + 1):
-
         if port != my_port:
-            send_message(udp_socket, port, "JOIN")
+            send_packet(sock, port, "JOIN")
 
 
 def receive_messages(
-    udp_socket, my_port, active_peers, peers_lock, stop_event
+    sock, my_port, active_peers,
+    pending, receive_state, lock, stop_event
 ):
-    """Receive messages and update the peer list."""
+    """Receive peer messages and acknowledgments."""
+
 
     while not stop_event.is_set():
 
         try:
-            data, address = udp_socket.recvfrom(1024)
+            data, address = sock.recvfrom(4096)
+            sender_ip, sender_port = address
+
+            if sender_ip != HOST or sender_port == my_port:
+                continue
+
+            if not FIRST_PORT <= sender_port <= LAST_PORT:
+                continue
 
             message = data.decode("utf-8")
-            sender_port = address[1]
 
-            if address[0] != HOST:
-                continue
+            # Handle discovery and heartbeat
+            if message in ("JOIN", "WELCOME", "HEARTBEAT"):
 
-            if sender_port == my_port:
-                continue
-
-            if not (FIRST_PORT <= sender_port <= LAST_PORT):
-                continue
-
-            # New peer announces itself.
-            if message == "JOIN":
-
-                with peers_lock:
+                with lock:
                     is_new = sender_port not in active_peers
-                    active_peers.add(sender_port)
+                    active_peers[sender_port] = time.monotonic()
 
                 if is_new:
-                    print(f"\nPeer {sender_port} joined.")
+                    print(f"\nPeer {sender_port} is now active.")
+                    print("You: ", end="", flush=True)
 
-                send_message(udp_socket, sender_port, "WELCOME")
+                if message == "JOIN":
+                    send_packet(sock, sender_port, "WELCOME")
 
-            # Existing peer responds to JOIN.
-            elif message == "WELCOME":
+                continue
 
-                with peers_lock:
-                    is_new = sender_port not in active_peers
-                    active_peers.add(sender_port)
+            # Decode JSON
+            packet = json.loads(message)
 
-                if is_new:
-                    print(f"\nDiscovered Peer {sender_port}")
+            if not isinstance(packet, dict):
+                continue
 
-            # Normal group chat message.
-            elif message.startswith("CHAT:"):
+            if packet.get("version") != VERSION:
+                continue
 
-                with peers_lock:
-                    known_peer = sender_port in active_peers
+            packet_type = packet.get("type")
+            session = packet.get("session")
+            seq = packet.get("seq")
 
-                if known_peer:
-                    chat_text = message[5:]
+            if not isinstance(session, str) or not session:
+                continue
 
-                    print(
-                        f"\n[Peer {sender_port}]: {chat_text}"
-                    )
+            if type(seq) is not int or seq < 1:
+                continue
 
-            print("You: ", end="", flush=True)
+            # Handle ACK packets
+            if packet_type == "ACK":
+
+                if packet.get("ack_session") != SESSION_ID:
+                    continue
+
+                with lock:
+                    active_peers[sender_port] = time.monotonic()
+
+                    key = (sender_port, seq)
+
+                    if key in pending:
+                        del pending[key]
+
+                        print(
+                            f"\nACK received from Peer "
+                            f"{sender_port} for seq={seq}"
+                        )
+                        print("You: ", end="", flush=True)
+
+                continue
+
+            if packet_type != "CHAT":
+                continue
+
+            chat_text = packet.get("message")
+
+            if not isinstance(chat_text, str):
+                continue
+
+            # Prepare acknowledgment
+            ack = {
+                "version": VERSION,
+                "type": "ACK",
+                "session": SESSION_ID,
+                "ack_session": session,
+                "seq": seq
+            }
+
+            # TEST: Deliberately drop one ACK on Peer B
+            send_packet(sock, sender_port, ack)
+
+            # Maintain ordering per sender session
+            key = (sender_port, session)
+            delivered = []
+
+            with lock:
+
+                is_new = sender_port not in active_peers
+                active_peers[sender_port] = time.monotonic()
+
+                if key not in receive_state:
+                    receive_state[key] = {
+                        "expected": 1,
+                        "buffer": {}
+                    }
+
+                state = receive_state[key]
+
+                # Store messages not already delivered
+                if seq >= state["expected"]:
+                    state["buffer"][seq] = chat_text
+
+                # Deliver only consecutive messages
+                while state["expected"] in state["buffer"]:
+
+                    current = state["expected"]
+                    text = state["buffer"].pop(current)
+
+                    delivered.append((current, text))
+                    state["expected"] += 1
+
+            if is_new:
+                print(f"\nPeer {sender_port} is now active.")
+
+            for number, text in delivered:
+
+                print(
+                    f"\n[Peer {sender_port}, "
+                    f"seq={number}]: {text}"
+                )
+
+            if is_new or delivered:
+                print("You: ", end="", flush=True)
 
         except socket.timeout:
             continue
 
-        except UnicodeDecodeError:
+        except (ValueError, UnicodeDecodeError):
             continue
 
         except OSError:
             if not stop_event.is_set():
-                print("\nError receiving message.")
+                print("\nReceive error.")
             break
+
+
+def maintain_peers(
+    sock, my_port, active_peers,
+    pending, lock, stop_event
+):
+    """Send heartbeats and retry unacknowledged packets."""
+
+    last_heartbeat = time.monotonic()
+
+    while not stop_event.wait(0.2):
+
+        now = time.monotonic()
+
+        resend = []
+        failed_messages = []
+        failed_peers = []
+
+        with lock:
+
+            # Detect inactive peers
+            for port, last_seen in list(active_peers.items()):
+
+                if now - last_seen > FAILURE_TIMEOUT:
+
+                    del active_peers[port]
+                    failed_peers.append(port)
+
+            # Check messages waiting for ACK
+            for key, record in list(pending.items()):
+
+                port, seq = key
+
+                if port in failed_peers:
+                    del pending[key]
+                    failed_messages.append(key)
+                    continue
+
+                if now - record["last_sent"] < ACK_TIMEOUT:
+                    continue
+
+                if record["attempts"] >= MAX_ATTEMPTS:
+                    del pending[key]
+                    failed_messages.append(key)
+                    continue
+
+                record["attempts"] += 1
+                record["last_sent"] = now
+
+                resend.append((
+                    port,
+                    seq,
+                    record["packet"],
+                    record["attempts"]
+                ))
+
+            active_ports = list(active_peers.keys())
+
+        # Report disconnected peers
+        for port in failed_peers:
+            print(f"\nPeer {port} inactive (timeout).")
+            print("You: ", end="", flush=True)
+
+        # Report unconfirmed deliveries
+        for port, seq in failed_messages:
+            print(
+                f"\nDelivery not confirmed: "
+                f"Peer {port}, seq={seq}"
+            )
+            print("You: ", end="", flush=True)
+
+        # Retransmit missing packets
+        for port, seq, packet, attempt in resend:
+
+            try:
+                send_packet(sock, port, packet)
+
+                print(
+                    f"\nRetransmitting to Peer {port}: "
+                    f"seq={seq}, attempt={attempt}"
+                )
+                print("You: ", end="", flush=True)
+
+            except OSError:
+                pass
+
+        # Regular heartbeat and rediscovery
+        if now - last_heartbeat >= HEARTBEAT_INTERVAL:
+
+            for port in active_ports:
+                try:
+                    send_packet(sock, port, "HEARTBEAT")
+                except OSError:
+                    pass
+
+            discover_peers(sock, my_port)
+            last_heartbeat = now
 
 
 def main():
@@ -106,94 +298,130 @@ def main():
 
     try:
         my_port = int(sys.argv[1])
-
     except ValueError:
-        print("Error: Port must be an integer.")
+        print("Port must be an integer.")
         return
 
-    if not (FIRST_PORT <= my_port <= LAST_PORT):
+    if not FIRST_PORT <= my_port <= LAST_PORT:
         print("Port must be between 5001 and 5010.")
         return
 
-    udp_socket = socket.socket(
+    sock = socket.socket(
         socket.AF_INET,
         socket.SOCK_DGRAM
     )
 
+    active_peers = {}
+    send_seq = {}
+    pending = {}
+    receive_state = {}
+
+    lock = threading.Lock()
     stop_event = threading.Event()
-    active_peers = set()
-    peers_lock = threading.Lock()
+    threads = []
 
     try:
-        udp_socket.bind((HOST, my_port))
-        udp_socket.settimeout(0.2)
+        sock.bind((HOST, my_port))
+        sock.settimeout(0.2)
 
         receiver_thread = threading.Thread(
             target=receive_messages,
             args=(
-                udp_socket,
-                my_port,
-                active_peers,
-                peers_lock,
-                stop_event
+                sock, my_port, active_peers,
+                pending, receive_state,
+                lock, stop_event
             )
         )
 
-        receiver_thread.start()
+        maintenance_thread = threading.Thread(
+            target=maintain_peers,
+            args=(
+                sock, my_port, active_peers,
+                pending, lock, stop_event
+            )
+        )
 
-        print(f"Peer started on port {my_port}")
+        threads = [
+            receiver_thread,
+            maintenance_thread
+        ]
+
+        receiver_thread.start()
+        maintenance_thread.start()
+
+        print(f"Reliable UDP Peer started: {my_port}")
         print("Commands: /peers, /quit")
 
-        # Discover currently running peers.
-        discover_peers(udp_socket, my_port)
+        discover_peers(sock, my_port)
 
         while True:
 
             try:
                 message = input("You: ")
-
             except (EOFError, KeyboardInterrupt):
                 break
 
-            if message == "/quit":
+            if message.strip() == "/quit":
                 break
 
-            if message == "/peers":
+            if message.strip() == "/peers":
 
-                with peers_lock:
-                    peers_copy = sorted(active_peers)
+                with lock:
+                    peers_copy = sorted(active_peers.keys())
 
-                print("Known peers:", peers_copy)
+                print("Active peers:", peers_copy)
                 continue
 
             if not message:
                 continue
 
-            # Copy the peer list safely.
-            with peers_lock:
-                peers_copy = list(active_peers)
+            with lock:
 
-            for port in peers_copy:
-                send_message(
-                    udp_socket,
-                    port,
-                    "CHAT:" + message
-                )
+                peers_copy = list(active_peers.keys())
+                packets_to_send = []
+
+                for port in peers_copy:
+
+                    seq = send_seq.get(port, 0) + 1
+                    send_seq[port] = seq
+
+                    packet = {
+                        "version": VERSION,
+                        "type": "CHAT",
+                        "session": SESSION_ID,
+                        "seq": seq,
+                        "message": message
+                    }
+
+                    pending[(port, seq)] = {
+                        "packet": packet,
+                        "last_sent": time.monotonic(),
+                        "attempts": 1
+                    }
+
+                    packets_to_send.append(
+                        (port, packet)
+                    )
+
+            for port, packet in packets_to_send:
+                send_packet(sock, port, packet)
 
             print(
-                f"Message sent to {len(peers_copy)} peer(s)."
+                f"Sent reliably to {len(peers_copy)} peer(s)."
             )
 
     except OSError as error:
         print(f"Network error: {error}")
 
     finally:
+
         stop_event.set()
 
-        if "receiver_thread" in locals():
-            receiver_thread.join()
+        for thread in threads:
+            if thread.ident is not None:
+                thread.join()
 
-        udp_socket.close()
+        sock.close()
         print("Peer closed.")
 
 

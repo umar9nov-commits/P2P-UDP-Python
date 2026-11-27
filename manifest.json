@@ -1,0 +1,28 @@
+{
+    "version": 1,
+    "filename": "sample.bin",
+    "file_size": 12288,
+    "file_sha256": "8dec5fb0de8a0b457c0cf7be559e4ef488e9cf39d5ddb0ff7464b23372ab21fa",
+    "chunk_size": 4096,
+    "total_chunks": 3,
+    "chunks": [
+        {
+            "index": 0,
+            "filename": "chunk_0000.bin",
+            "size": 4096,
+            "sha256": "c8f5d0341d54d951a71b136e6e2afcb14d11ed8489a7ae126a8fee0df6ecf193"
+        },
+        {
+            "index": 1,
+            "filename": "chunk_0001.bin",
+            "size": 4096,
+            "sha256": "c8f5d0341d54d951a71b136e6e2afcb14d11ed8489a7ae126a8fee0df6ecf193"
+        },
+        {
+            "index": 2,
+            "filename": "chunk_0002.bin",
+            "size": 4096,
+            "sha256": "c8f5d0341d54d951a71b136e6e2afcb14d11ed8489a7ae126a8fee0df6ecf193"
+        }
+    ]
+}
