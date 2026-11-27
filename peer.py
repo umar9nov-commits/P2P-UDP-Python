@@ -452,6 +452,11 @@ def main():
                 file_sharing.share_file(sock, message.strip()[7:], peers_copy)
                 continue
 
+            if message.strip().startswith("/get "):
+                name = message.strip()[5:]
+                threading.Thread(target=file_sharing.download_file, args=(sock, name)).start()
+                continue
+
             if message.strip() == "/files":
                 file_sharing.show_files()
                 continue

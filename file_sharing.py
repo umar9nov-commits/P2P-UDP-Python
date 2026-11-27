@@ -10,6 +10,7 @@ so they never mix with the chat messages of peer.py (stream 0).
 import base64
 import hashlib
 import os
+import random
 import threading
 import time
 
@@ -148,6 +149,14 @@ def handle_packet(sock, sender_port, packet):
     if packet["type"] == protocol.STORE_CHUNK:
         receive_piece(data)
 
+    if packet["type"] == protocol.CHUNK_DATA:
+        receive_piece(data, protocol.CHUNK_DATA)
+
+    if packet["type"] == protocol.CHUNK_REQUEST:
+        # send it from a new thread, so this peer can keep receiving
+        threading.Thread(target=serve_chunk,
+                         args=(sock, sender_port, data["file"], data["chunk"])).start()
+
 
 # ---------------- commands ----------------
 
@@ -261,7 +270,7 @@ def wait_for_acks(port=None, timeout=10):
         time.sleep(0.01)
 
 
-def send_chunk(sock, port, name, index, chunk):
+def send_chunk(sock, port, name, index, chunk, msg_type=protocol.STORE_CHUNK):
     """Send one chunk to a peer as 1 KB pieces (STORE_CHUNK messages)."""
 
     # Cut the chunk into small pieces that fit in one UDP packet
@@ -277,19 +286,19 @@ def send_chunk(sock, port, name, index, chunk):
             "total_pieces": len(pieces),
             "data": base64.b64encode(pieces[number]).decode("ascii")
         }
-        send_reliable(sock, port, protocol.STORE_CHUNK, data)
+        send_reliable(sock, port, msg_type, data)
 
     # Wait until this chunk has arrived before sending the next one,
     # so we do not flood the other peer with thousands of packets at once
     wait_for_acks(port)
 
 
-def receive_piece(data):
+def receive_piece(data, msg_type=protocol.STORE_CHUNK):
     """Collect the pieces of a chunk. When it is complete, check it and save it."""
 
     name = data["file"]
     index = data["chunk"]
-    key = (name, index)
+    key = (name, index, msg_type)
 
     with lock:
         if key not in incoming:
@@ -315,6 +324,10 @@ def receive_piece(data):
         print("You: ", end="", flush=True)
         return
 
+    if msg_type == protocol.CHUNK_DATA:
+        downloaded[(name, index)] = chunk
+        return
+
     chunk_path = os.path.join(storage_folder(), f"{name}.chunk{index}")
     with open(chunk_path, "wb") as f:
         f.write(chunk)
@@ -333,3 +346,80 @@ def receive_piece(data):
     if stored == my_total:
         print(f"\nStored all {stored} of my chunks of {name} (SHA-256 checked).")
         print("You: ", end="", flush=True)
+
+
+# ---------------- step 7: downloading a file ----------------
+
+downloaded = {}     # (file name, chunk number) -> chunk received from another peer
+
+
+def serve_chunk(sock, port, name, index):
+    """Another peer asked me for a chunk: send it."""
+
+    chunk_path = os.path.join(storage_folder(), f"{name}.chunk{index}")
+
+    if os.path.isfile(chunk_path):
+        with open(chunk_path, "rb") as f:
+            chunk = f.read()
+        send_chunk(sock, port, name, index, chunk, protocol.CHUNK_DATA)
+
+
+def download_file(sock, name):
+    """/get <file>: collect all chunks and rebuild the file."""
+
+    if name not in files:
+        print("Unknown file:", name)
+        return
+
+    info = files[name]
+    total = len(info["chunks"])
+    asked = {}                      # peer -> how many chunks I asked it for
+    start_time = time.monotonic()
+
+    # 1. Ask for every chunk I do not have, from one of its holders (chosen at random)
+    for i in range(total):
+        my_copy = os.path.join(storage_folder(), f"{name}.chunk{i}")
+
+        if not os.path.isfile(my_copy):
+            options = []
+            for port in info["holders"][i]:
+                if port != my_port:
+                    options.append(port)
+
+            port = random.choice(options)
+            asked[port] = asked.get(port, 0) + 1
+            send_reliable(sock, port, protocol.CHUNK_REQUEST, {"file": name, "chunk": i})
+
+    # 2. Put the file together: my own chunks + the chunks that arrive
+    file_data = b""
+
+    for i in range(total):
+        my_copy = os.path.join(storage_folder(), f"{name}.chunk{i}")
+
+        if os.path.isfile(my_copy):
+            with open(my_copy, "rb") as f:
+                file_data = file_data + f.read()
+        else:
+            # wait (at most 30 seconds) for this chunk to arrive
+            while (name, i) not in downloaded and time.monotonic() - start_time < 30:
+                time.sleep(0.05)
+
+            if (name, i) not in downloaded:
+                print(f"\nDownload failed: chunk {i} did not arrive.")
+                return
+
+            file_data = file_data + downloaded.pop((name, i))
+
+    # 3. Check the fingerprint of the whole file, then save it
+    if calculate_hash(file_data) != info["sha256"]:
+        print("\nDownload failed: the file is damaged.")
+        return
+
+    os.makedirs(f"downloads_{my_port}", exist_ok=True)
+    with open(f"downloads_{my_port}/{name}", "wb") as f:
+        f.write(file_data)
+
+    seconds = time.monotonic() - start_time
+    print(f"\nDownloaded {name} in {seconds:.1f} s, SHA-256 OK.")
+    print(f"Chunks asked from peers: {asked}")
+    print("You: ", end="", flush=True)

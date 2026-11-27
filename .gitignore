@@ -12,3 +12,4 @@ chunks/
 peer_storage/
 network_received/storage_*/
 *.bin
+downloads_*/
