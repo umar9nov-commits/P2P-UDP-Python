@@ -10,4 +10,5 @@ sample.bin
 recovered_sample.bin
 chunks/
 peer_storage/
-network_received/
+network_received/storage_*/
+*.bin

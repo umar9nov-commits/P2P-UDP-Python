@@ -100,3 +100,11 @@ if __name__ == "__main__":
     assert read_packet(packet[:-1]) is None    # broken length is rejected
 
     print("protocol.py test passed")
+
+# File-sharing message types (sent on stream 1)
+FILE_ANNOUNCE = 32
+HAVE_CHUNK = 33
+CHUNK_REQUEST = 34
+CHUNK_DATA = 35
+CHUNK_ERROR = 36
+STORE_CHUNK = 37

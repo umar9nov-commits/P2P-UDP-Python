@@ -7,6 +7,7 @@ import json
 import uuid
 
 import protocol
+import file_sharing
 
 HOST = "127.0.0.1"
 FIRST_PORT = 5001
@@ -97,13 +98,20 @@ def receive_messages(
     while not stop_event.is_set():
 
         try:
-            data, address = sock.recvfrom(4096)
+            data, address = sock.recvfrom(65535)
             sender_ip, sender_port = address
 
             if sender_ip != HOST or sender_port == my_port:
                 continue
 
             if not FIRST_PORT <= sender_port <= LAST_PORT:
+                continue
+
+            # File-sharing packets (stream 1) go to file_sharing.py
+            file_packet = protocol.read_packet(data)
+
+            if file_packet is not None and file_packet["stream"] == 1:
+                file_sharing.handle_packet(sock, sender_port, file_packet)
                 continue
 
             message = decode_packet(data)
@@ -271,6 +279,9 @@ def maintain_peers(
 
         now = time.monotonic()
 
+        # Resend file packets that were not acknowledged
+        file_sharing.resend_missing(sock)
+
         resend = []
         failed_messages = []
         failed_peers = []
@@ -390,6 +401,8 @@ def main():
         sock.bind((HOST, my_port))
         sock.settimeout(0.2)
 
+        file_sharing.setup(my_port, int(SESSION_ID[:8], 16))
+
         receiver_thread = threading.Thread(
             target=receive_messages,
             args=(
@@ -417,6 +430,7 @@ def main():
 
         print(f"Reliable UDP Peer started: {my_port}")
         print("Commands: /peers, /quit")
+        print("File commands: /share <file>, /files")
 
         discover_peers(sock, my_port)
 
@@ -429,6 +443,18 @@ def main():
 
             if message.strip() == "/quit":
                 break
+
+            if message.strip().startswith("/share "):
+
+                with lock:
+                    peers_copy = list(active_peers.keys())
+
+                file_sharing.share_file(sock, message.strip()[7:], peers_copy)
+                continue
+
+            if message.strip() == "/files":
+                file_sharing.show_files()
+                continue
 
             if message.strip() == "/peers":
 
