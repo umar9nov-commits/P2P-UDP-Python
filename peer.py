@@ -29,6 +29,7 @@ TYPE_CODES = {
     "JOIN": protocol.JOIN,
     "WELCOME": protocol.WELCOME,
     "HEARTBEAT": protocol.HEARTBEAT,
+    "LEAVE": protocol.LEAVE,
     "ACK": protocol.ACK,
     "CHAT": protocol.CHAT
 }
@@ -108,6 +109,22 @@ def receive_messages(
             message = decode_packet(data)
 
             if message is None:
+                continue
+
+            # A peer is leaving the group on purpose
+            if message == "LEAVE":
+
+                with lock:
+                    if sender_port in active_peers:
+                        del active_peers[sender_port]
+
+                    # Stop waiting for ACKs from the peer that left
+                    for key in list(pending.keys()):
+                        if key[0] == sender_port:
+                            del pending[key]
+
+                print(f"\nPeer {sender_port} left the group.")
+                print("You: ", end="", flush=True)
                 continue
 
             # Handle discovery and heartbeat
@@ -463,6 +480,16 @@ def main():
         print(f"Network error: {error}")
 
     finally:
+
+        # Tell everyone we are leaving (so they know it is not a crash)
+        with lock:
+            peers_copy = list(active_peers.keys())
+
+        for port in peers_copy:
+            try:
+                send_packet(sock, port, "LEAVE")
+            except OSError:
+                pass
 
         stop_event.set()
 
