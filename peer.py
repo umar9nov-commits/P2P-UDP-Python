@@ -6,6 +6,8 @@ import time
 import json
 import uuid
 
+import protocol
+
 HOST = "127.0.0.1"
 FIRST_PORT = 5001
 LAST_PORT = 5010
@@ -21,15 +23,59 @@ SESSION_ID = uuid.uuid4().hex
 # TEMPORARY TEST: Peer 5002 drops its first CHAT ACK
 
 
+
+# Message names used in this file -> type numbers in our protocol header
+TYPE_CODES = {
+    "JOIN": protocol.JOIN,
+    "WELCOME": protocol.WELCOME,
+    "HEARTBEAT": protocol.HEARTBEAT,
+    "ACK": protocol.ACK,
+    "CHAT": protocol.CHAT
+}
+
+TYPE_NAMES = {}
+for name, code in TYPE_CODES.items():
+    TYPE_NAMES[code] = name
+
+
 def send_packet(sock, port, packet):
-    """Send a text or JSON packet using UDP."""
+    """Send a text or JSON packet using UDP, with our protocol header in front."""
+
+    # The header needs the session as a number, so use part of the session text
+    session_number = int(SESSION_ID[:8], 16)
 
     if isinstance(packet, dict):
-        data = json.dumps(packet).encode("utf-8")
+        msg_type = TYPE_CODES[packet["type"]]
+        seq = packet.get("seq", 0)
+        data = packet
+        reliable = packet["type"] == "CHAT"
     else:
-        data = packet.encode("utf-8")
+        msg_type = TYPE_CODES[packet]
+        seq = 0
+        data = None
+        reliable = False
 
-    sock.sendto(data, (HOST, port))
+    header_and_data = protocol.make_packet(
+        msg_type, session_number, seq, data, reliable
+    )
+
+    sock.sendto(header_and_data, (HOST, port))
+
+
+def decode_packet(data):
+    """Remove our header. Gives back the same text or dictionary as before."""
+
+    packet = protocol.read_packet(data)
+
+    if packet is None:
+        return None
+
+    # CHAT and ACK carry a dictionary
+    if packet["data"]:
+        return packet["data"]
+
+    # JOIN, WELCOME and HEARTBEAT carry no data, so give back their name
+    return TYPE_NAMES.get(packet["type"])
 
 
 def discover_peers(sock, my_port):
@@ -59,7 +105,10 @@ def receive_messages(
             if not FIRST_PORT <= sender_port <= LAST_PORT:
                 continue
 
-            message = data.decode("utf-8")
+            message = decode_packet(data)
+
+            if message is None:
+                continue
 
             # Handle discovery and heartbeat
             if message in ("JOIN", "WELCOME", "HEARTBEAT"):
@@ -77,8 +126,8 @@ def receive_messages(
 
                 continue
 
-            # Decode JSON
-            packet = json.loads(message)
+            # CHAT and ACK messages are dictionaries
+            packet = message
 
             if not isinstance(packet, dict):
                 continue
