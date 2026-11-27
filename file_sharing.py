@@ -7,6 +7,7 @@ File packets use their own sequence numbers and their own ACK table,
 so they never mix with the chat messages of peer.py (stream 0).
 """
 
+import base64
 import hashlib
 import os
 import threading
@@ -144,6 +145,9 @@ def handle_packet(sock, sender_port, packet):
         )
         print("You: ", end="", flush=True)
 
+    if packet["type"] == protocol.STORE_CHUNK:
+        receive_piece(data)
+
 
 # ---------------- commands ----------------
 
@@ -198,7 +202,18 @@ def share_file(sock, path, peer_ports):
     for port in peer_ports:
         send_reliable(sock, port, protocol.FILE_ANNOUNCE, info)
 
-    print(f"Shared {name}: {len(chunks)} chunks, announced to {len(peer_ports)} peer(s).")
+    # 6. Send every chunk to its holders (each chunk goes to 2 peers)
+    wait_for_acks()          # first make sure everyone got the announcement
+
+    sent = 0
+    for i in range(len(chunks)):
+        for port in holders[i]:
+            if port != my_port:
+                send_chunk(sock, port, name, i, chunks[i])
+                sent += 1
+
+    print(f"Shared {name}: {len(chunks)} chunks, announced to {len(peer_ports)} peer(s), "
+          f"sent {sent} chunk copies.")
 
 
 def show_files():
@@ -219,3 +234,102 @@ def show_files():
 
             for port in sorted(count):
                 print(f"   peer {port} stores {count[port]} chunks")
+
+
+# ---------------- step 6: sending and storing chunks ----------------
+
+PIECE_SIZE = 1024     # bytes of file data in one packet
+incoming = {}         # (file name, chunk number) -> {piece number: bytes}
+
+
+def wait_for_acks(port=None, timeout=10):
+    """Wait until our packets (to one peer, or to everyone) are acknowledged."""
+
+    deadline = time.monotonic() + timeout
+
+    while time.monotonic() < deadline:
+
+        with lock:
+            still_waiting = 0
+            for key in waiting_ack:
+                if port is None or key[0] == port:
+                    still_waiting += 1
+
+        if still_waiting == 0:
+            return
+
+        time.sleep(0.01)
+
+
+def send_chunk(sock, port, name, index, chunk):
+    """Send one chunk to a peer as 1 KB pieces (STORE_CHUNK messages)."""
+
+    # Cut the chunk into small pieces that fit in one UDP packet
+    pieces = []
+    for start in range(0, len(chunk), PIECE_SIZE):
+        pieces.append(chunk[start:start + PIECE_SIZE])
+
+    for number in range(len(pieces)):
+        data = {
+            "file": name,
+            "chunk": index,
+            "piece": number,
+            "total_pieces": len(pieces),
+            "data": base64.b64encode(pieces[number]).decode("ascii")
+        }
+        send_reliable(sock, port, protocol.STORE_CHUNK, data)
+
+    # Wait until this chunk has arrived before sending the next one,
+    # so we do not flood the other peer with thousands of packets at once
+    wait_for_acks(port)
+
+
+def receive_piece(data):
+    """Collect the pieces of a chunk. When it is complete, check it and save it."""
+
+    name = data["file"]
+    index = data["chunk"]
+    key = (name, index)
+
+    with lock:
+        if key not in incoming:
+            incoming[key] = {}
+
+        incoming[key][data["piece"]] = base64.b64decode(data["data"])
+
+        # Not all pieces yet: wait for more
+        if len(incoming[key]) < data["total_pieces"]:
+            return
+
+        pieces = incoming.pop(key)
+        info = files.get(name)
+
+    # Join the pieces in the right order
+    chunk = b""
+    for number in range(data["total_pieces"]):
+        chunk = chunk + pieces[number]
+
+    # Check the fingerprint before saving
+    if info is None or calculate_hash(chunk) != info["chunks"][index]:
+        print(f"\nChunk {index} of {name} is damaged, not saved.")
+        print("You: ", end="", flush=True)
+        return
+
+    chunk_path = os.path.join(storage_folder(), f"{name}.chunk{index}")
+    with open(chunk_path, "wb") as f:
+        f.write(chunk)
+
+    # When all my chunks of this file are stored, tell the user
+    my_total = 0
+    for pair in info["holders"]:
+        if my_port in pair:
+            my_total += 1
+
+    stored = 0
+    for file_name in os.listdir(storage_folder()):
+        if file_name.startswith(f"{name}.chunk"):
+            stored += 1
+
+    if stored == my_total:
+        print(f"\nStored all {stored} of my chunks of {name} (SHA-256 checked).")
+        print("You: ", end="", flush=True)
